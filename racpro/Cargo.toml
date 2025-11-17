@@ -5,7 +5,7 @@ authors = ["RAC"]
 edition = "2021"
 description = "Rac PRO, Made By LuaCodder"
 repository = "https://github.com/dhgatjeye/rac-pro"
-license = "Apache-2.0"
+license = "GPL-3"
 
 [profile.release]
 debug = false
