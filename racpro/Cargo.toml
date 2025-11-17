@@ -2,7 +2,7 @@
 name = "racpro"
 version = "0.0.2"
 authors = ["RAC"]
-edition = "2021"
+edition = "2024"
 description = "Rac PRO, Made By LuaCodder"
 repository = "https://github.com/dhgatjeye/rac-pro"
 license = "GPL-3"
