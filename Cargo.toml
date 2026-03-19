@@ -7,12 +7,6 @@ description = "Rac PRO, Made By LuaCodder"
 repository = "https://github.com/dhgatjeye/rac-pro"
 license = "GPL-3.0"
 
-[profile.release]
-debug = false
-debug-assertions = false
-rpath = false
-strip = "symbols"
-
 [dependencies.windows]
 version = "0.62.2"
 features = [
@@ -24,3 +18,10 @@ features = [
     "Win32_System_Performance",
     "Win32_System_Threading",
 ]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+rpath = false
