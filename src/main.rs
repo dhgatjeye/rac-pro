@@ -1,19 +1,32 @@
-use crossterm::{
-    cursor::{Hide, MoveTo},
-    terminal::{Clear, ClearType},
-    QueueableCommand,
-};
-use std::io::{self, stdout, Write};
+use std::io::{self, Write};
 use windows::{
-    core::*,
     Win32::{
         Foundation::*,
         Media::*,
         Security::*,
-        System::{LibraryLoader::*, Performance::*, Threading::*},
+        System::{Console::*, LibraryLoader::*, Performance::*, Threading::*},
     },
+    core::*,
 };
 
+unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
+    match ctrl_type {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT
+        | CTRL_SHUTDOWN_EVENT => {
+            reset_to_default();
+            BOOL(1)
+        }
+        _ => BOOL(0),
+    }
+}
+
+fn register_ctrl_handler() {
+    unsafe {
+        let _ = SetConsoleCtrlHandler(Some(ctrl_handler), true);
+    }
+}
+
+#[allow(non_snake_case)]
 type NtQueryTimerResolution = unsafe extern "system" fn(
     MinimumResolution: *mut u32,
     MaximumResolution: *mut u32,
@@ -21,6 +34,7 @@ type NtQueryTimerResolution = unsafe extern "system" fn(
 ) -> i32;
 
 struct CleanupHandler;
+
 struct MutexHandle(HANDLE);
 
 impl Drop for CleanupHandler {
@@ -35,12 +49,47 @@ impl Drop for MutexHandle {
     }
 }
 
+fn stdout_handle() -> Option<HANDLE> {
+    unsafe {
+        match GetStdHandle(STD_OUTPUT_HANDLE) {
+            Ok(h) if h != INVALID_HANDLE_VALUE => Some(h),
+            _ => None,
+        }
+    }
+}
+
 pub fn clear_console() {
-    let mut out = stdout();
-    let _ = out.queue(Hide);
-    let _ = out.queue(Clear(ClearType::All));
-    let _ = out.queue(MoveTo(0, 0));
-    let _ = out.flush();
+    unsafe {
+        let handle = match stdout_handle() {
+            Some(h) => h,
+            None => return,
+        };
+
+        let mut csbi = CONSOLE_SCREEN_BUFFER_INFO::default();
+        if GetConsoleScreenBufferInfo(handle, &mut csbi).is_err() {
+            return;
+        }
+
+        let cell_count = (csbi.dwSize.X as u32) * (csbi.dwSize.Y as u32);
+        let origin = COORD { X: 0, Y: 0 };
+        let mut written = 0u32;
+
+        let _ = FillConsoleOutputCharacterW(handle, ' ' as u16, cell_count, origin, &mut written);
+        let _ = FillConsoleOutputAttribute(
+            handle,
+            csbi.wAttributes.0,
+            cell_count,
+            origin,
+            &mut written,
+        );
+        let _ = SetConsoleCursorPosition(handle, origin);
+
+        let cursor_info = CONSOLE_CURSOR_INFO {
+            dwSize: 1,
+            bVisible: BOOL(0),
+        };
+        let _ = SetConsoleCursorInfo(handle, &cursor_info);
+    }
 }
 
 fn is_running_as_admin() -> bool {
@@ -53,40 +102,26 @@ fn is_running_as_admin() -> bool {
         let mut elevation = TOKEN_ELEVATION::default();
         let mut size = size_of::<TOKEN_ELEVATION>() as u32;
 
-        let result = if GetTokenInformation(
+        let result = GetTokenInformation(
             token_handle,
             TokenElevation,
             Some(&mut elevation as *mut _ as *mut _),
             size,
             &mut size,
         )
-            .is_ok()
-        {
-            elevation.TokenIsElevated != 0
-        } else {
-            false
-        };
+        .is_ok()
+            && elevation.TokenIsElevated != 0;
 
         let _ = CloseHandle(token_handle);
-
         result
     }
 }
 
 fn create_app_mutex() -> Option<MutexHandle> {
-    let mutex_name = w!("Global\\InputLagApplicationMutex");
-
     unsafe {
-        match CreateMutexW(None, false, mutex_name) {
-            Ok(handle) => {
-                let last_error = GetLastError();
-                if last_error == ERROR_ALREADY_EXISTS {
-                    None
-                } else {
-                    Some(MutexHandle(handle))
-                }
-            }
-            Err(_) => None,
+        match CreateMutexW(None, false, w!("Global\\InputLagApplicationMutex")) {
+            Ok(handle) if GetLastError() != ERROR_ALREADY_EXISTS => Some(MutexHandle(handle)),
+            _ => None,
         }
     }
 }
@@ -94,12 +129,11 @@ fn create_app_mutex() -> Option<MutexHandle> {
 fn reset_to_default() -> bool {
     unsafe {
         let _ = timeEndPeriod(1);
-        let default_period = 16;
-        if timeBeginPeriod(default_period) == TIMERR_NOERROR {
+        if timeBeginPeriod(16) == TIMERR_NOERROR {
             println!("Successfully reset to default (~15.6ms)");
             true
         } else {
-            println!("Failed to reset to default");
+            println!("Failed to reset to default.");
             false
         }
     }
@@ -117,164 +151,152 @@ fn get_caps() -> Option<(u32, u32)> {
 }
 
 fn set_custom() -> bool {
-    if let Some((min, max)) = get_caps() {
-        let target = 1;
-        unsafe {
-            if target < min {
-                println!("System minimum is higher than 1ms ({}ms)", min);
-                println!("Setting to system minimum: {}ms", min);
-                timeBeginPeriod(min);
-            } else if target > max {
-                println!("1ms exceeds system maximum ({}ms)", max);
-                println!("Setting to system maximum: {}ms", max);
-                timeBeginPeriod(max);
-            } else {
-                timeBeginPeriod(target);
-                println!("SC set to: {}ms", target);
-            }
-            return true;
+    let (min, max) = match get_caps() {
+        Some(caps) => caps,
+        None => {
+            println!("Failed to query timer capabilities.");
+            return false;
         }
+    };
+
+    let target: u32 = 1;
+    let period = target.clamp(min, max);
+
+    unsafe {
+        timeBeginPeriod(period);
     }
-    println!("Failed to set.");
-    false
+
+    if period != target {
+        println!(
+            "Requested {}ms is out of range [{min}ms, {max}ms]. Set to {period}ms instead.",
+            target
+        );
+    } else {
+        println!("Timer resolution set to: {period}ms");
+    }
+
+    true
 }
 
 fn measure(iterations: u32) {
     unsafe {
         let h_ntdll = match LoadLibraryW(w!("NtDll.dll")) {
-            Ok(handle) => handle,
+            Ok(h) => h,
             Err(_) => {
-                println!("LoadLibrary failed");
+                println!("Failed to load NtDll.dll");
                 return;
             }
         };
 
-        let func_name = s!("NtQueryTimerResolution");
-        let nt_query_timer_resolution = match GetProcAddress(h_ntdll, func_name) {
-            Some(addr) => std::mem::transmute::<_, NtQueryTimerResolution>(addr),
-            None => {
-                println!("Failed to load NtQueryTimerResolution");
-                let _ = FreeLibrary(h_ntdll);
-                return;
-            }
-        };
+        let nt_query_timer_resolution: NtQueryTimerResolution =
+            match GetProcAddress(h_ntdll, s!("NtQueryTimerResolution")) {
+                Some(addr) => std::mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    NtQueryTimerResolution,
+                >(addr),
+                None => {
+                    println!("Failed to resolve NtQueryTimerResolution.");
+                    let _ = FreeLibrary(h_ntdll);
+                    return;
+                }
+            };
 
         let mut freq = 0i64;
-        if QueryPerformanceFrequency(&mut freq).is_err() {
-            println!("QueryPerformanceFrequency failed");
+        if QueryPerformanceFrequency(&mut freq).is_err() || freq == 0 {
+            println!("QueryPerformanceFrequency failed.");
             let _ = FreeLibrary(h_ntdll);
             return;
         }
 
-        let mut total_elapsed = 0.0;
+        let mut total_elapsed = 0.0f64;
 
         for _ in 0..iterations {
-            let mut min_res: u32 = 0;
-            let mut max_res: u32 = 0;
-            let mut cur_res: u32 = 0;
-
-            if nt_query_timer_resolution(&mut min_res, &mut max_res, &mut cur_res) != 0 {
-                println!("NtQueryTimerResolution failed");
-                let _ = FreeLibrary(h_ntdll);
-                return;
-            }
-
             let mut start = 0i64;
             let mut end = 0i64;
-
             let _ = QueryPerformanceCounter(&mut start);
             Sleep(1);
             let _ = QueryPerformanceCounter(&mut end);
-
-            let elapsed = (end - start) as f64 / freq as f64 * 1000.0;
-            total_elapsed += elapsed;
+            total_elapsed += (end - start) as f64 / freq as f64 * 1000.0;
         }
 
         let avg_elapsed = total_elapsed / iterations as f64;
-        let mut cur_res: u32 = 0;
-        let mut min_res: u32 = 0;
-        let mut max_res: u32 = 0;
+
+        let mut min_res = 0u32;
+        let mut max_res = 0u32;
+        let mut cur_res = 0u32;
         nt_query_timer_resolution(&mut min_res, &mut max_res, &mut cur_res);
 
         println!(
-            "Average over {} iterations: {:.3}ms (Resolution: {:.3}ms, Min: {:.3}ms, Max: {:.3}ms)",
-            iterations,
-            avg_elapsed,
-            cur_res as f64 / 10000.0,
-            min_res as f64 / 10000.0,
-            max_res as f64 / 10000.0
+            "Average over {iterations} iterations: {avg_elapsed:.3}ms \
+             (Resolution: {:.3}ms, Min: {:.3}ms, Max: {:.3}ms)",
+            cur_res as f64 / 10_000.0,
+            min_res as f64 / 10_000.0,
+            max_res as f64 / 10_000.0,
         );
 
         let _ = FreeLibrary(h_ntdll);
     }
 }
 
+fn pause() {
+    println!("Press Enter to continue...");
+    let mut buf = String::new();
+    let _ = io::stdin().read_line(&mut buf);
+}
+
 fn main() {
     let _cleanup = CleanupHandler;
+    register_ctrl_handler();
 
-    let _mutex_handle = match create_app_mutex() {
-        Some(handle) => handle,
+    let _mutex = match create_app_mutex() {
+        Some(h) => h,
         None => {
-            println!("Another instance of this application is already running.");
-            println!("Please close the other instance first.");
-            println!("Press Enter to exit...");
-            let mut _input = String::new();
-            let _ = io::stdin().read_line(&mut _input);
+            println!("Another instance is already running. Please close it first.");
+            pause();
             return;
         }
     };
 
     if !is_running_as_admin() {
-        println!("This application requires administrator privileges.");
-        println!("Please restart the program as administrator.");
-        println!("Press Enter to exit...");
-        let mut _input = String::new();
-        let _ = io::stdin().read_line(&mut _input);
+        println!("Administrator privileges are required. Please restart as administrator.");
+        pause();
         return;
     }
 
     loop {
         clear_console();
-        println!("1. Set to 1ms (if supported)");
-        println!("2. Measure");
-        println!("3. Close");
+        println!("1. Set timer resolution to 1ms");
+        println!("2. Measure sleep accuracy (100 iterations)");
+        println!("3. Exit");
         println!("4. Reset to default (~15.6ms)");
-        print!("Select an option (1-4): ");
-        let _ = stdout().flush();
+        print!("\nSelect an option (1-4): ");
+        let _ = io::stdout().flush();
 
         let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .expect("Failed to read input");
+        if io::stdin().read_line(&mut input).is_err() {
+            break;
+        }
 
         match input.trim() {
             "1" => {
                 set_custom();
-                println!("Press Enter to continue...");
-                let mut _input = String::new();
-                let _ = io::stdin().read_line(&mut _input);
+                pause();
             }
             "2" => {
                 measure(100);
-                println!("Press Enter to continue...");
-                let mut _input = String::new();
-                let _ = io::stdin().read_line(&mut _input);
+                pause();
             }
             "3" => {
-                println!("Closing application...");
+                println!("Exiting...");
                 break;
             }
             "4" => {
                 reset_to_default();
-                println!("Press Enter to continue...");
-                let mut _input = String::new();
-                let _ = io::stdin().read_line(&mut _input);
+                pause();
             }
             _ => {
-                println!("Invalid option! Please select 1, 2, 3, or 4.");
-                println!("Press Enter to continue...");
-                let mut _input = String::new();
-                let _ = io::stdin().read_line(&mut _input);
+                println!("Invalid option. Please enter 1, 2, 3, or 4.");
+                pause();
             }
         }
     }
