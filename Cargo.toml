@@ -1,11 +1,11 @@
 [package]
 name = "racpro"
-version = "0.0.3"
+version = "0.0.4"
 authors = ["RAC"]
 edition = "2024"
 description = "Rac PRO, Made By LuaCodder"
 repository = "https://github.com/dhgatjeye/rac-pro"
-license = "GPL-3"
+license = "GPL-3.0"
 
 [profile.release]
 debug = false
@@ -13,17 +13,14 @@ debug-assertions = false
 rpath = false
 strip = "symbols"
 
-[dependencies]
-crossterm = "0.29.0"
-
 [dependencies.windows]
 version = "0.62.2"
 features = [
     "Win32_Foundation",
     "Win32_Media",
     "Win32_Security",
+    "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_Performance",
     "Win32_System_Threading",
-    "Win32_System_WindowsProgramming",
 ]
